@@ -1,0 +1,28 @@
+name: Push to primary [sandbox-svc-review-9]
+run-name: ""
+"on":
+  push:
+    branches:
+      - main
+jobs:
+  invoke-pipeline:
+    name: Infrastream
+    secrets: inherit
+    uses: twinscan-care/default-managed-workflows-public/.github/workflows/north-sec-sandbox-svc-review-9-sandbox-svc-review-9-primary-branch-push.yml@main
+  merge-authorized:
+    runs-on:
+      - ubuntu-latest
+    name: Merge Authorized
+    steps:
+      - id: merge-authorized
+        name: Merge Authorized
+        run: echo 'Authorized!'
+    needs:
+      - invoke-pipeline
+permissions:
+  actions: write
+  checks: write
+  contents: write
+  id-token: write
+  pull-requests: write
+  security-events: write
