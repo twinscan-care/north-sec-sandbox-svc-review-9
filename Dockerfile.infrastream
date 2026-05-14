@@ -12,6 +12,7 @@ WORKDIR /root/
 
 # Copy the binary from builder stage
 COPY dist/* .
+RUN chmod +x /root/*
 
 # Set environment variables
 ENV GIN_MODE=release
