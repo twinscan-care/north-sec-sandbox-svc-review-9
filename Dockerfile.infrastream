@@ -20,4 +20,4 @@ ENV RELEASE_VERSION=${RELEASE_VERSION}
 ENV RELEASE_TYPE=${RELEASE_TYPE}
 
 # Run the application
-CMD ["./sandbox-svc-review"]
+CMD ["./sandbox-svc-review-9"]

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"fmt"
 	"log"
@@ -194,10 +196,32 @@ func initDB(config *Config) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
+
+	// Log connection details for debugging
+	var currentDB, searchPath string
+	_ = db.QueryRow("SELECT current_database()").Scan(&currentDB)
+	_ = db.QueryRow("SHOW search_path").Scan(&searchPath)
+	log.Printf("Connected to database: %s, search_path: %s", currentDB, searchPath)
+
 	// Initialize database schema
-	if _, err := db.Exec(getInitSQL()); err != nil {
-		log.Printf("Failed to initialize database: %v. Continuing...", err)
+	stmts := getInitStatements()
+	log.Printf("Executing %d init statements...", len(stmts))
+	for i, stmt := range stmts {
+		preview := stmt
+		if len(preview) > 80 {
+			preview = preview[:80] + "..."
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("Init statement %d/%d FAILED: %v | %s", i+1, len(stmts), err, preview)
+		} else {
+			log.Printf("Init statement %d/%d OK | %s", i+1, len(stmts), preview)
+		}
 	}
+
+	// Verify tables were created
+	var tableCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('categories', 'products', 'reviews')").Scan(&tableCount)
+	log.Printf("Verification: found %d/3 expected tables in public schema", tableCount)
 
 	log.Println("Database connection established")
 	return db, nil
@@ -205,11 +229,41 @@ func initDB(config *Config) (*sql.DB, error) {
 
 // initRedis establishes a connection to the Redis server.
 func initRedis(config *Config) *redis.Client {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     config.RedisHost + ":" + config.RedisPort,
-		Password: "",
-		DB:       0,
-	})
+	const redisCertPath = "/var/secrets/redis-cert.pem"
+
+	var tlsCfg *tls.Config
+	certPEM, err := os.ReadFile(redisCertPath)
+	if err != nil {
+		log.Printf("Warning: could not read Redis TLS certificate at %s: %v. Proceeding without TLS.", redisCertPath, err)
+	} else {
+		certPool := x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(certPEM) {
+			log.Printf("Warning: failed to parse Redis TLS certificate at %s. Proceeding without TLS.", redisCertPath)
+		} else {
+			tlsCfg = &tls.Config{
+				RootCAs: certPool,
+			}
+		}
+	}
+
+	redisURL := os.Getenv("REDIS_URL")
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Printf("Warning: could not parse REDIS_URL: %v. Falling back to defaults.", err)
+		opts = &redis.Options{
+			Addr: "localhost:6379",
+			DB:   0,
+		}
+	}
+
+	// If we have a custom CA cert, merge it into the TLS config from ParseURL
+	if tlsCfg != nil && opts.TLSConfig != nil {
+		opts.TLSConfig.RootCAs = tlsCfg.RootCAs
+	} else if tlsCfg != nil {
+		opts.TLSConfig = tlsCfg
+	}
+
+	rdb := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
@@ -220,71 +274,63 @@ func initRedis(config *Config) *redis.Client {
 	return rdb
 }
 
-func getInitSQL() string {
-	return `
--- Create the categories table first, as other tables depend on it.
-CREATE TABLE IF NOT EXISTS categories (
-    id UUID PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    parent_id UUID,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_categories_parent_id FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE SET NULL
-);
+func getInitStatements() []string {
+	return []string{
+		// 1. Enable uuid-ossp extension
+		`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`,
 
--- Create the products table
-CREATE TABLE IF NOT EXISTS products (
-    id UUID PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    price NUMERIC(10, 2) NOT NULL,
-    inventory INT NOT NULL,
-    category_id UUID,
-    image_url VARCHAR(255),
-    sku VARCHAR(100),
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_products_category_id FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
-);
+		// 2. Create the categories table
+		`CREATE TABLE IF NOT EXISTS categories (
+			id UUID PRIMARY KEY,
+			name VARCHAR(255) NOT NULL,
+			description TEXT,
+			parent_id UUID,
+			created_at TIMESTAMPTZ DEFAULT NOW(),
+			updated_at TIMESTAMPTZ DEFAULT NOW(),
+			CONSTRAINT fk_categories_parent_id FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE SET NULL
+		)`,
 
+		// 3. Create the products table
+		`CREATE TABLE IF NOT EXISTS products (
+			id UUID PRIMARY KEY,
+			name VARCHAR(255) NOT NULL,
+			description TEXT,
+			price NUMERIC(10, 2) NOT NULL,
+			inventory INT NOT NULL,
+			category_id UUID,
+			image_url VARCHAR(255),
+			sku VARCHAR(100),
+			is_active BOOLEAN DEFAULT TRUE,
+			created_at TIMESTAMPTZ DEFAULT NOW(),
+			updated_at TIMESTAMPTZ DEFAULT NOW(),
+			CONSTRAINT fk_products_category_id FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+		)`,
 
+		// 4. Create the reviews table
+		`CREATE TABLE IF NOT EXISTS reviews (
+			id UUID PRIMARY KEY,
+			product_id UUID NOT NULL,
+			rating INT NOT NULL CHECK (rating >= 1 AND rating <= 5),
+			title VARCHAR(255),
+			comment TEXT,
+			is_verified BOOLEAN DEFAULT FALSE,
+			created_at TIMESTAMPTZ DEFAULT NOW(),
+			updated_at TIMESTAMPTZ DEFAULT NOW(),
+			CONSTRAINT fk_reviews_product_id FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+		)`,
 
--- Create the reviews table
-CREATE TABLE IF NOT EXISTS reviews (
-    id UUID PRIMARY KEY,
-    product_id UUID NOT NULL,
-    rating INT NOT NULL CHECK (rating >= 1 AND rating <= 5),
-    title VARCHAR(255),
-    comment TEXT,
-    is_verified BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT fk_reviews_product_id FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-);
+		// 5. Create indexes
+		`CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews(product_id)`,
 
--- Add indexes for performance
-CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id);
-CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
-CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews(product_id);
-
--- =================================================================
--- Mock Data Insertion
--- =================================================================
-
--- Generate UUIDs for consistent mock data
--- These are just examples. In a real scenario, you might use a function or generate them on the fly.
--- For simplicity, we are hardcoding them here.
--- Categories
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-DO $$
+		// 6. Seed mock data
+		`DO $$
 DECLARE
     cat_electronics uuid := 'a1b2c3d4-e5f6-7788-9900-aabbccddeeff';
     cat_laptops uuid := 'b2c3d4e5-f6a7-8899-0011-bbccddeeff00';
     cat_keyboards uuid := 'c3d4e5f6-a7b8-9900-1122-ccddeeff0011';
     cat_mice uuid := 'd4e5f6a7-b8c9-0011-2233-ddeeff001122';
-    -- Products
     prod_laptop_1 uuid := 'e5f6a7b8-c9d0-1122-3344-eeff00112233';
     prod_laptop_2 uuid := 'f6a7b8c9-d0e1-2233-4455-ff0011223344';
     prod_laptop_3 uuid := 'a7b8c9d0-e1f2-3344-5566-001122334455';
@@ -294,7 +340,6 @@ DECLARE
     prod_mouse_2 uuid := 'e1f2a3b4-c5d6-7788-9900-445566778899';
 BEGIN
 
--- Insert Categories
 INSERT INTO categories (id, name, description, parent_id) VALUES
 (cat_electronics, 'Electronics', 'Gadgets and devices', NULL),
 (cat_laptops, 'Laptops', 'Portable computers', cat_electronics),
@@ -302,7 +347,6 @@ INSERT INTO categories (id, name, description, parent_id) VALUES
 (cat_mice, 'Mice', 'Gaming and office mice', cat_electronics)
 ON CONFLICT (id) DO NOTHING;
 
--- Insert Products
 INSERT INTO products (id, name, description, price, inventory, category_id, image_url, sku) VALUES
 (prod_laptop_1, 'ProBook 15', 'A powerful and sleek laptop for professionals.', 1299.99, 50, cat_laptops, 'https://images.unsplash.com/photo-1517336714731-489689fd1ca8?w=500', 'PRO-15-2024'),
 (prod_laptop_2, 'GamerX Pro', 'Top-tier gaming laptop with RGB lighting.', 1999.99, 25, cat_laptops, 'https://images.unsplash.com/photo-1588872657578-7efd1f1555ed?w=500', 'GAMERX-PRO-24'),
@@ -313,7 +357,6 @@ INSERT INTO products (id, name, description, price, inventory, category_id, imag
 (prod_mouse_2, 'ErgoClick E-1', 'Ergonomic vertical mouse to reduce wrist strain.', 49.99, 250, cat_mice, 'https://images.unsplash.com/photo-1628375639392-142203901f41?w=500', 'ERGO-E1-GRY')
 ON CONFLICT (id) DO NOTHING;
 
--- Insert Reviews
 INSERT INTO reviews (id, product_id, rating, title, comment, is_verified) VALUES
 (uuid_generate_v4(), prod_laptop_1, 5, 'Absolutely fantastic!', 'This laptop is fast, has a great screen, and the battery life is amazing.', true),
 (uuid_generate_v4(), prod_laptop_1, 4, 'Very good, but not perfect', 'A solid choice for work, but it can get a bit hot under heavy load.', true),
@@ -324,6 +367,7 @@ INSERT INTO reviews (id, product_id, rating, title, comment, is_verified) VALUES
 (uuid_generate_v4(), prod_mouse_2, 5, 'My wrist thanks me', 'Took a day to get used to, but now I can''t go back to a regular mouse.', true)
 ON CONFLICT (id) DO NOTHING;
 
-END $$;
-`
+END $$`,
+	}
 }
+
